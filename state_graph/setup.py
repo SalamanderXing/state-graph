@@ -6,7 +6,7 @@ os.system("rm -rf build dist")
 
 setup(
     name="state_graph",
-    version="0.1.2.4",
+    version="0.1.2.5",
     packages=find_packages(),
     install_requires=[
         "pydantic",
@@ -15,5 +15,6 @@ setup(
         "beartype",
         "rich",
         "ipython",
+        "resend",
     ],
 )

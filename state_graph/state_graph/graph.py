@@ -2,6 +2,8 @@ from re import I
 from regex import P
 from rich import print
 import os
+import traceback
+import json
 from typing import TypedDict, Any, get_type_hints, Annotated, get_origin
 import operator
 from pydantic import BaseModel
@@ -21,6 +23,9 @@ import base64
 from . import utils
 from .node import Node, EndNode, WaitingNode, StartNode
 from .edge import Edge, SimpleEdge
+import resend
+
+resend.api_key = "re_7Teuhi6C_JnfKohguULAmTD1Ha9Q5ywEF"
 
 
 # beartype_this_package()
@@ -43,6 +48,24 @@ class Graph:
     __initial_context: BaseModel
     __on_state_enter_callbacks: dict[str, Callable[[BaseModel], Awaitable] | None]
     __on_state_exit_callbacks: dict[str, Callable[[BaseModel], Awaitable] | None]
+    __resend_api_key: str | None = None
+    __resend_email: str | None = None
+
+    @property
+    def resend_api_key(self):
+        return self.__resend_api_key
+
+    @resend_api_key.setter
+    def resend_api_key(self, value: str):
+        self.__resend_api_key = value
+
+    @property
+    def resend_email(self):
+        return self.__resend_email
+
+    @resend_email.setter
+    def resend_email(self, value: str):
+        self.__resend_email = value
 
     @property
     def stream_token(self):
@@ -106,9 +129,8 @@ class Graph:
 
     def reset(self, new_state: dict[str, Any] | None = None) -> "Graph":
         new_state = new_state or {}
-        initial_context = self.__initial_context.__class__(
-            **self.__initial_context.model_copy().model_dump() | new_state
-        )
+        dump = self.__initial_context.model_copy().model_dump() | new_state
+        initial_context = self.__initial_context.__class__(**dump)
         new_graph = Graph(
             context=initial_context,
             name=self.graph.name,
@@ -234,7 +256,36 @@ class Graph:
             if isinstance(self.current_node, WaitingNode):
                 return self.context, False
 
-            context_update = await self.current_node.run(self.context)
+            try:
+                context_update = await self.current_node.run(self.context)
+            except Exception as e:
+                if self.resend_api_key is not None and self.resend_email is not None:
+                    content = f"""
+<p>An error occurred in the state graph {self.name}</p>
+<p>Here is the error: <pre>{e}</pre></p>
+<p>Here is the context: 
+<pre>
+{json.dumps(self.context.model_dump())}
+</pre>
+</p>
+<h3>Stack trace</h3>
+<p><pre>{traceback.format_exc()}</pre>
+</p>
+<h3>Node Name</h3>
+<p>{self.current_node.name}</p>
+"""
+                    r = resend.Emails.send(
+                        {
+                            "from": self.resend_email,
+                            "to": self.resend_email,
+                            "subject": "An error occurred",
+                            "html": content,
+                        }
+                    )
+                    raise e
+                else:
+                    raise e
+
             self.context = utils.update_context(self.context, context_update)
 
         return self.context, is_end
