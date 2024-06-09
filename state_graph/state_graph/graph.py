@@ -288,6 +288,7 @@ class Graph:
                         message=str(e),
                     )
                 )
+                await asyncio.sleep(1)
                 raise e
 
             self.context = utils.update_context(self.context, context_update)
