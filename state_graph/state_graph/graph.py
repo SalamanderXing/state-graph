@@ -3,6 +3,7 @@ from regex import P
 from rich import print
 import os
 import traceback
+import uuid
 import json
 from typing import TypedDict, Any, get_type_hints, Annotated, get_origin
 import operator
@@ -23,15 +24,24 @@ import base64
 from . import utils
 from .node import Node, EndNode, WaitingNode, StartNode
 from .edge import Edge, SimpleEdge
-import resend
-
-resend.api_key = "re_7Teuhi6C_JnfKohguULAmTD1Ha9Q5ywEF"
 
 
 # beartype_this_package()
 
 
 T = TypeVar("T", bound=BaseModel)
+
+
+class Event(BaseModel):
+    run_id: str
+    context: BaseModel
+    name: str
+    event_type: Literal[
+        "node_execution_error",
+        "edge_execution_error",
+        "state_enter",
+    ]
+    message: str | None = None
 
 
 class Graph:
@@ -48,24 +58,8 @@ class Graph:
     __initial_context: BaseModel
     __on_state_enter_callbacks: dict[str, Callable[[BaseModel], Awaitable] | None]
     __on_state_exit_callbacks: dict[str, Callable[[BaseModel], Awaitable] | None]
-    __resend_api_key: str | None = None
-    __resend_email: str | None = None
-
-    @property
-    def resend_api_key(self):
-        return self.__resend_api_key
-
-    @resend_api_key.setter
-    def resend_api_key(self, value: str):
-        self.__resend_api_key = value
-
-    @property
-    def resend_email(self):
-        return self.__resend_email
-
-    @resend_email.setter
-    def resend_email(self, value: str):
-        self.__resend_email = value
+    on_event: Callable[[Event], Awaitable] | None = None
+    id: str
 
     @property
     def stream_token(self):
@@ -127,7 +121,9 @@ class Graph:
 
         self.__is_compiled = True
 
-    def reset(self, new_state: dict[str, Any] | None = None) -> "Graph":
+    def reset(
+        self, new_state: dict[str, Any] | None = None, id: str | None = None
+    ) -> "Graph":
         new_state = new_state or {}
         dump = self.__initial_context.model_copy().model_dump() | new_state
         initial_context = self.__initial_context.__class__(**dump)
@@ -138,6 +134,7 @@ class Graph:
             edges=self.edges.copy(),
             stream_token=self.__stream_token,
             _is_compiled=self.__is_compiled,
+            id=id,
         )
         return new_graph
 
@@ -156,6 +153,7 @@ class Graph:
         ) = None,
         on_state_exit: dict[str, Callable[[BaseModel], Awaitable] | None] | None = None,
         _is_compiled: bool = False,
+        id: str | None = None,
     ) -> None:
         nodes = nodes if nodes is not None else {}
         edges = edges if edges is not None else {}
@@ -166,6 +164,7 @@ class Graph:
         self.__initial_context = context
         self.context = context.copy()
         self.__is_compiled = _is_compiled
+        self.id = id or str(uuid.uuid4())
 
         async def _stream_token(token: str):
             pass
@@ -229,6 +228,11 @@ class Graph:
     ):
         self.add_edge(SimpleEdge(start_node, out_node, name, label))
 
+    def __log_event(self, event: Event):
+        if self.on_event is not None:
+            on_event = self.on_event(event)
+            asyncio.create_task(on_event)
+
     async def run(self, input: dict[str, Any] | None = None) -> tuple[BaseModel, bool]:
         assert self.__is_compiled, "Graph must be compiled before running"
         input = input or {}
@@ -251,42 +255,51 @@ class Graph:
 
             if isinstance(self.current_node, EndNode):
                 is_end = True
+                self.__log_event(
+                    Event(
+                        context=self.context,
+                        event_type="state_enter",
+                        name=self.current_node.name,
+                        run_id=self.id,
+                    )
+                )
                 break
 
             if isinstance(self.current_node, WaitingNode):
+                self.__log_event(
+                    Event(
+                        context=self.context,
+                        event_type="state_enter",
+                        name=self.current_node.name,
+                        run_id=self.id,
+                    )
+                )
                 return self.context, False
 
             try:
                 context_update = await self.current_node.run(self.context)
             except Exception as e:
-                if self.resend_api_key is not None and self.resend_email is not None:
-                    content = f"""
-<p>An error occurred in the state graph {self.name}</p>
-<p>Here is the error: <pre>{e}</pre></p>
-<p>Here is the context: 
-<pre>
-{json.dumps(self.context.model_dump())}
-</pre>
-</p>
-<h3>Stack trace</h3>
-<p><pre>{traceback.format_exc()}</pre>
-</p>
-<h3>Node Name</h3>
-<p>{self.current_node.name}</p>
-"""
-                    r = resend.Emails.send(
-                        {
-                            "from": self.resend_email,
-                            "to": self.resend_email,
-                            "subject": "An error occurred",
-                            "html": content,
-                        }
+                self.__log_event(
+                    Event(
+                        context=self.context,
+                        event_type="node_execution_error",
+                        name=self.current_node.name,
+                        run_id=self.id,
+                        message=str(e),
                     )
-                    raise e
-                else:
-                    raise e
+                )
+                raise e
 
             self.context = utils.update_context(self.context, context_update)
+
+            self.__log_event(
+                Event(
+                    context=self.context,
+                    event_type="state_enter",
+                    name=self.current_node.name,
+                    run_id=self.id,
+                )
+            )
 
         return self.context, is_end
 
@@ -299,7 +312,19 @@ class Graph:
             len(matching_edges) == 1
         ), f"Multiple edges found for node {current_node_name}"
         for edge in matching_edges:
-            next_node_name = edge.fn(context)
+            try:
+                next_node_name = edge.fn(context)
+            except Exception as e:
+                self.__log_event(
+                    Event(
+                        context=context,
+                        event_type="edge_execution_error",
+                        name=edge.name,
+                        run_id=self.id,
+                        message=str(e),
+                    )
+                )
+                raise e
             assert (
                 next_node_name in edge.out_nodes
             ), f"Edge {edge.name} does not have a valid out node"
