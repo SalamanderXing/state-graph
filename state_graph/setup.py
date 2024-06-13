@@ -6,15 +6,14 @@ os.system("rm -rf build dist")
 
 setup(
     name="state_graph",
-    version="0.1.3",
+    version="0.1.9",
     packages=find_packages(),
     install_requires=[
         "pydantic",
         "networkx",
-        "matplotlib",
         "beartype",
         "rich",
         "ipython",
-        "resend",
+        # "resend",
     ],
 )

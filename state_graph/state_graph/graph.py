@@ -279,13 +279,15 @@ class Graph:
             try:
                 context_update = await self.current_node.run(self.context)
             except Exception as e:
+                error_msg: str = str(e)
+                traceback_details: str = traceback.format_exc()
                 self.__log_event(
                     Event(
                         context=self.context,
                         event_type="node_execution_error",
                         name=self.current_node.name,
                         run_id=self.id,
-                        message=str(e),
+                        message=f"{error_msg}\nTraceback: {traceback_details}",
                     )
                 )
                 await asyncio.sleep(1)
