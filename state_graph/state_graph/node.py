@@ -32,7 +32,10 @@ class Node(BaseModel):
     name: str
     color: str = "blue"
     static_context: BaseModel | None = None
+    input_fields: list[str] = []
+    merge_flows: bool = False
     _stream_token: list[Callable[[str], Awaitable]] = []
+    _logs: list[str] = []
 
     class Config:
         frozen = True
@@ -52,8 +55,27 @@ class Node(BaseModel):
     async def run(self, context: T) -> dict | T:
         return {}
 
-    def __init__(self, static_context: BaseModel | None = None, **kwargs):
-        super().__init__(**kwargs, static_context=static_context)
+    async def run_with_logs(self, context: T) -> tuple[dict | T, list[str]]:
+        self._logs = []
+        return await self.run(context), self._logs
+
+    def log(self, message: Any, print_also=True):
+        self._logs.append(message.__repr__())
+        if print_also:
+            print(message)
+
+    def __init__(
+        self,
+        static_context: BaseModel | None = None,
+        merge_flows: bool = False,
+        **kwargs,
+    ):
+        super().__init__(
+            **kwargs, static_context=static_context, merge_flows=merge_flows
+        )
+        self._logs = []
+        if merge_flows:
+            print(f"[red]{self.name=} {merge_flows=} [/red]")
         if static_context is not None:
             # check that it is frozen
             assert not utils.is_mutable(
@@ -70,7 +92,7 @@ class WaitingNode(Node):
         self,
         name: str,
     ) -> None:
-        super().__init__(name=name, color="orange", _is_waiting=True)
+        super().__init__(name=name, color="orange", input_fields=[], _is_waiting=True)
 
 
 class StartNode(Node):
@@ -79,7 +101,7 @@ class StartNode(Node):
     """
 
     def __init__(self) -> None:
-        super().__init__(name="start", color="green")
+        super().__init__(name="start", color="green", input_fields=[])
 
 
 class EndNode(Node):
@@ -89,19 +111,31 @@ class EndNode(Node):
     """
 
     def __init__(self, name="end") -> None:
-        super().__init__(name=name, color="red")
+        super().__init__(name=name, color="red", input_fields=[])
 
 
-def node(fn: Callable):
+def node(input_fields: list[str], merge_flows: bool = False):
     """
     Decorator to turn a function into a node. This works well for relatively simple nodes.
     """
 
-    class _Node(Node):
-        def __init__(self, name: str) -> None:
-            super().__init__(name=name)
+    def decorator(fn: Callable):
+        class _Node(Node):
+            def __init__(
+                self,
+                name: str,
+                input_fields: list[str],
+            ) -> None:
+                super().__init__(
+                    name=name,
+                    input_fields=input_fields,
+                    merge_flows=merge_flows,
+                )
 
-        async def run(self, context: dict) -> dict:
-            return await fn(context)
+            async def run(self, context: dict) -> dict:
+                res = await fn(context)
+                return res
 
-    return _Node(name=fn.__name__)
+        return _Node(name=fn.__name__, input_fields=input_fields)
+
+    return decorator
