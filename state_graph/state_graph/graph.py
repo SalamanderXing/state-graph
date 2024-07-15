@@ -1,7 +1,6 @@
-from re import I
-from regex import P
 from rich import print
 import os
+import ipdb
 import traceback
 import uuid
 import json
@@ -31,6 +30,23 @@ from .edge import Edge, SimpleEdge
 
 
 T = TypeVar("T", bound=BaseModel)
+
+
+class NodeDefinition(BaseModel):
+    name: str
+    label: str | None = None
+
+
+class EdgeDefinition(BaseModel):
+    name: str
+    label: str | None = None
+    start_node: str
+    out_nodes: list[str]
+
+
+class GraphDefinition(BaseModel):
+    nodes: list[NodeDefinition]
+    edges: list[EdgeDefinition]
 
 
 class Event(BaseModel):
@@ -121,6 +137,7 @@ class Graph:
     __initial_context: BaseModel
     __on_state_enter_callbacks: dict[str, Callable[[BaseModel], Awaitable] | None]
     __on_state_exit_callbacks: dict[str, Callable[[BaseModel], Awaitable] | None]
+    guards: list[Callable[[BaseModel], bool]] = []
     on_event: Callable[[Event], Awaitable] | None = None
     id: str
 
@@ -201,6 +218,8 @@ class Graph:
             stream_token=self.__stream_token,
             _is_compiled=self.__is_compiled,
             id=id,
+            guards=self.guards,
+            on_event=self.on_event
         )
         return new_graph
 
@@ -220,11 +239,14 @@ class Graph:
         on_state_exit: dict[str, Callable[[BaseModel], Awaitable] | None] | None = None,
         _is_compiled: bool = False,
         id: str | None = None,
+        guards: list[Callable[[BaseModel], bool]] | None = None,
+        on_event: Callable[[Event], Awaitable] | None = None
     ) -> None:
         nodes = nodes if nodes is not None else {}
         edges = edges if edges is not None else {}
         self.nodes = {}
         self.edges = {}
+        self.guards = guards if guards is not None else []
         self.name = name
         self.graph = nx.MultiDiGraph(name=name)
         self.__initial_context = context
@@ -232,6 +254,7 @@ class Graph:
         self.__is_compiled = _is_compiled
         self.id = id or str(uuid.uuid4())
         self.t: int = 0
+        self.on_event = on_event
 
         async def _stream_token(token: str):
             pass
@@ -300,6 +323,14 @@ class Graph:
             on_event = self.on_event(event)
             asyncio.create_task(on_event)
 
+    def guard(self, context: BaseModel, message: str):
+        for guard in self.guards:
+            # assert guard(context), f"Guard {guard} failed"
+            result = guard(context)
+            if not result:
+                print(context)
+                assert False, f"Guard {guard} failed: {message}"
+
     async def run(self, input: dict[str, Any] | None = None) -> tuple[BaseModel, bool]:
         assert self.__is_compiled, "Graph must be compiled before running"
         input = input or {}
@@ -331,6 +362,10 @@ class Graph:
 
             active_nodes = new_active_nodes
 
+            if len(active_nodes) == 1:
+                print(f"{active_nodes[0].node.name=}")
+                self.context = active_nodes[0].context
+
             # Check if all nodes have stopped (waiting or done)
             if all(
                 node.is_done or node.merge_flows or node.is_waiting
@@ -343,12 +378,6 @@ class Graph:
                         f"Nodes have stopped in different states: {node_names}"
                     )
 
-                # Merge contexts of all stopped nodes
-                # merged_context = active_nodes[0].context
-                # for node_state in active_nodes[1:]:
-                #     merged_context = utils.merge_context(
-                #         merged_context, node_state.context
-                #     )
                 partial_contexts = [
                     (
                         node.partial_context
@@ -363,10 +392,17 @@ class Graph:
 
                 assert len(set(all_keys)) == len(all_keys), "All keys must be unique"
 
-                merged_context = {}
+                merged_context_dict = {}
                 for partial_context in partial_contexts:
-                    merged_context.update(partial_context)
-                merged_context = utils.merge_context(self.context, merged_context)
+                    merged_context_dict.update(partial_context)
+                for key in merged_context_dict:
+                    assert hasattr(self.context, key), f"Context has no attribute {key}"
+                merged_context = self.context.model_copy()
+                for key, value in merged_context_dict.items():
+                    setattr(merged_context, key, value)
+                self.guard(
+                    merged_context, f"Guards failed after merging nodes {node_names}"
+                )
                 is_done = all(node.is_done for node in active_nodes)
                 is_waiting = all(node.is_waiting for node in active_nodes)
                 if is_waiting or is_done:
@@ -380,14 +416,14 @@ class Graph:
             print(
                 f"New active nodes names: {[node.node.name for node in active_nodes]}"
             )
-            if len(active_nodes) == 1:
-                self.context = active_nodes[0].context
             self.t += 1
         return self.context, True  # this will hopefully never happen.
 
     async def run_node(self, node_state: NodeState) -> list[NodeState]:
         node = node_state.node
         context = node_state.context
+
+        self.guard(context, f"Guard failed before node {node.name}")
 
         if node.name in self.__on_state_enter_callbacks:
             callback = self.__on_state_enter_callbacks[node.name]
@@ -406,8 +442,7 @@ class Graph:
         except Exception as e:
             error_msg: str = str(e)
             traceback_details: str = traceback.format_exc()
-            self.__log_event(
-                Event(
+            event = Event(
                     output=None,
                     context=subset_context,
                     event_type="node_execution_error",
@@ -417,12 +452,15 @@ class Graph:
                     logs="\n".join(node._logs),
                     t=self.t,
                 )
-            )
+            if self.on_event is not None:
+                print('On event!!!!')
+                await self.on_event(event)
+            print(f"[red]ERRRRRRRROOOOOOOOOR")
             await asyncio.sleep(1)
             raise e
 
         new_context = utils.update_context(context, context_update)
-
+        self.guard(new_context, f"Guard failed after node {node.name}")
         self.__log_event(
             Event(
                 output=(
@@ -438,7 +476,6 @@ class Graph:
                 t=self.t,
             )
         )
-
         if node.name in self.__on_state_exit_callbacks:
             callback = self.__on_state_exit_callbacks[node.name]
             if callback is not None:
@@ -490,6 +527,20 @@ class Graph:
                 raise e
 
         return next_nodes
+
+    def get_definition(self) -> GraphDefinition:
+        assert (
+            self.__is_compiled
+        ), "Graph must be compiled before getting the definition"
+        return GraphDefinition(
+            nodes=[NodeDefinition(name=k) for k in self.nodes.keys()],
+            edges=[
+                EdgeDefinition(
+                    start_node=v.start_node, out_nodes=list(v.out_nodes), name=v.name
+                )
+                for k, v in self.edges.items()
+            ],
+        )
 
     def plot(self, destination: str | None = None):
         print("plotting")
