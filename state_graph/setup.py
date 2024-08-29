@@ -6,7 +6,7 @@ os.system("rm -rf build dist")
 
 setup(
     name="state_graph",
-    version="0.2.3",
+    version="0.2.13",
     packages=find_packages(),
     install_requires=[
         "pydantic",

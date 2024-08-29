@@ -34,7 +34,10 @@ class Node(BaseModel):
     static_context: BaseModel | None = None
     input_fields: list[str] = []
     merge_flows: bool = False
+    allow_flow_split: bool = False
+    info: dict[str, str] = {}
     _stream_token: list[Callable[[str], Awaitable]] = []
+    _reset_stream: list[Callable[[], Awaitable]] = []
     _logs: list[str] = []
 
     class Config:
@@ -44,6 +47,18 @@ class Node(BaseModel):
     def stream_token(self):
         assert len(self._stream_token) == 1, "stream_token must be set."
         return self._stream_token[0]
+
+    @property
+    def reset_stream(self):
+        assert len(self._reset_stream) == 1, "reset_stream must be set."
+        return self._reset_stream[0]
+
+    def _set_reset_stream(self, value: Callable[[], Awaitable]):
+        if len(self._reset_stream) > 0:
+            # replace it
+            self._reset_stream[0] = value
+        else:
+            self._reset_stream.append(value)
 
     def _set_stream_token(self, value: Callable[[str], Awaitable]):
         if len(self._stream_token) > 0:
@@ -55,8 +70,13 @@ class Node(BaseModel):
     async def run(self, context: T) -> dict | T:
         return {}
 
-    async def run_with_logs(self, context: T) -> tuple[dict | T, list[str]]:
+    async def run_with_logs(
+        self, context: T, run_id: str
+    ) -> tuple[dict | T, list[str]]:
         self._logs = []
+        self.info["run_id"] = (
+            run_id  # FIXME: should find a solution for this. This is sketchy. Basically i need to access the run id from the nodes and this was the only way i could think of.
+        )
         return await self.run(context), self._logs
 
     def log(self, message: Any, print_also=True):
@@ -71,7 +91,9 @@ class Node(BaseModel):
         **kwargs,
     ):
         super().__init__(
-            **kwargs, static_context=static_context, merge_flows=merge_flows
+            **kwargs,
+            static_context=static_context,
+            merge_flows=merge_flows,
         )
         self._logs = []
         if merge_flows:
@@ -91,8 +113,15 @@ class WaitingNode(Node):
     def __init__(
         self,
         name: str,
+        allow_flow_split: bool = False,
     ) -> None:
-        super().__init__(name=name, color="orange", input_fields=[], _is_waiting=True)
+        super().__init__(
+            name=name,
+            color="orange",
+            input_fields=[],
+            _is_waiting=True,
+            allow_flow_split=allow_flow_split,
+        )
 
 
 class StartNode(Node):
@@ -114,7 +143,9 @@ class EndNode(Node):
         super().__init__(name=name, color="red", input_fields=[])
 
 
-def node(input_fields: list[str], merge_flows: bool = False):
+def node(
+    input_fields: list[str], merge_flows: bool = False, allow_flow_split: bool = False
+):
     """
     Decorator to turn a function into a node. This works well for relatively simple nodes.
     """
@@ -130,6 +161,7 @@ def node(input_fields: list[str], merge_flows: bool = False):
                     name=name,
                     input_fields=input_fields,
                     merge_flows=merge_flows,
+                    allow_flow_split=allow_flow_split,
                 )
 
             async def run(self, context: dict) -> dict:

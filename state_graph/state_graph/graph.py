@@ -20,13 +20,11 @@ from typing import (
 import asyncio
 import networkx as nx
 from IPython.display import display, HTML, Javascript, Image
+import time
 import base64
 from . import utils
 from .node import Node, EndNode, WaitingNode, StartNode
 from .edge import Edge, SimpleEdge
-
-
-# beartype_this_package()
 
 
 T = TypeVar("T", bound=BaseModel)
@@ -53,6 +51,9 @@ class Event(BaseModel):
     run_id: str
     context: BaseModel
     output: dict | None
+    start_time: float
+    end_time: float
+    duration: float
     name: str
     event_type: Literal[
         "node_execution_error", "edge_execution_error", "state_enter", "state_exit"
@@ -121,9 +122,6 @@ def create_subset_model(parent: BaseModel, props: list[str]) -> BaseModel:
 
 
 class Graph:
-
-    # TODO: add **t**
-
     """
     A graph represents the workflow of the app. It has a dynamic context that can be changed by the nodes and an optional
     static context that is not changed by the nodes.
@@ -134,12 +132,25 @@ class Graph:
     graph: nx.MultiDiGraph
     current_node: Node
     context: BaseModel
+    static_context: BaseModel
     __initial_context: BaseModel
     __on_state_enter_callbacks: dict[str, Callable[[BaseModel], Awaitable] | None]
     __on_state_exit_callbacks: dict[str, Callable[[BaseModel], Awaitable] | None]
-    guards: list[Callable[[BaseModel], bool]] = []
+    __stream_token: Callable[[str], Awaitable]
+    __reset_stream: Callable[[], Awaitable]
+    guards: list[Callable[[BaseModel], str | None]] = []
     on_event: Callable[[Event], Awaitable] | None = None
-    id: str
+    run_id: str
+
+    @property
+    def reset_stream(self):
+        return self.__reset_stream
+
+    @reset_stream.setter
+    def reset_stream(self, value: Callable[[], Awaitable]):
+        self.__reset_stream = value
+        for node in self.nodes.values():
+            node._set_reset_stream(value)
 
     @property
     def stream_token(self):
@@ -212,23 +223,24 @@ class Graph:
         initial_context = self.__initial_context.__class__(**dump)
         new_graph = Graph(
             context=initial_context,
+            static_context=self.static_context,
             name=self.graph.name,
             nodes=self.nodes.copy(),
             edges=self.edges.copy(),
             stream_token=self.__stream_token,
             _is_compiled=self.__is_compiled,
             id=id,
+            reset_stream=self.__reset_stream,
             guards=self.guards,
-            on_event=self.on_event
+            on_event=self.on_event,
         )
         return new_graph
-
-    __stream_token: Callable[[str], Awaitable]
 
     def __init__(
         self,
         *,
         context: BaseModel,
+        static_context: BaseModel,
         name: str = "graph",
         nodes: dict[str, Node] | None = None,
         edges: dict[str, Edge] | None = None,
@@ -239,8 +251,9 @@ class Graph:
         on_state_exit: dict[str, Callable[[BaseModel], Awaitable] | None] | None = None,
         _is_compiled: bool = False,
         id: str | None = None,
-        guards: list[Callable[[BaseModel], bool]] | None = None,
-        on_event: Callable[[Event], Awaitable] | None = None
+        guards: list[Callable[[BaseModel], str | None]] | None = None,
+        on_event: Callable[[Event], Awaitable] | None = None,
+        reset_stream: Callable[[], Awaitable] | None = None,
     ) -> None:
         nodes = nodes if nodes is not None else {}
         edges = edges if edges is not None else {}
@@ -250,18 +263,26 @@ class Graph:
         self.name = name
         self.graph = nx.MultiDiGraph(name=name)
         self.__initial_context = context
-        self.context = context.copy()
+        self.context = context.model_copy()
         self.__is_compiled = _is_compiled
-        self.id = id or str(uuid.uuid4())
+        self.run_id = id or str(uuid.uuid4())
         self.t: int = 0
         self.on_event = on_event
+        self.static_context = static_context
 
         async def _stream_token(token: str):
+            pass
+
+        async def _reset_stream():
             pass
 
         self.__stream_token = (
             stream_token if stream_token is not None else _stream_token
         )
+        self.__reset_stream = (
+            reset_stream if reset_stream is not None else _reset_stream
+        )
+
         if "start" not in nodes:
             # self.add_node(StartNode())
             self.nodes["start"] = StartNode()
@@ -319,24 +340,36 @@ class Graph:
         self.add_edge(SimpleEdge(start_node, out_node, name, label))
 
     def __log_event(self, event: Event):
+        if event.name == "start" and event.t > 0:
+            ipdb.set_trace()
+        assert not (
+            event.name == "start" and event.t > 0
+        ), "Start node cannot have t > 0"
         if self.on_event is not None:
             on_event = self.on_event(event)
             asyncio.create_task(on_event)
 
     def guard(self, context: BaseModel, message: str):
         for guard in self.guards:
-            # assert guard(context), f"Guard {guard} failed"
             result = guard(context)
-            if not result:
+            if result is not None:
                 print(context)
-                assert False, f"Guard {guard} failed: {message}"
+                print(f"{result=}")
+                assert False, f"Guard {guard}\nfailed: {message}\nError Cause: {result}"
 
     async def run(self, input: dict[str, Any] | None = None) -> tuple[BaseModel, bool]:
         assert self.__is_compiled, "Graph must be compiled before running"
         input = input or {}
 
+        if self.current_node.name == "start":
+            assert self.t == 0, "Graph must be reset before running"
+
         self.context = utils.merge_context(self.context, input)
-        active_nodes = [NodeState(self.nodes["start"], self.context, self.context)]
+        active_nodes = await self.run_node(
+            NodeState(self.current_node, self.context, self.context)
+        )
+
+        self.t += 1
 
         while active_nodes:
             new_active_nodes: list[NodeState] = []
@@ -365,6 +398,9 @@ class Graph:
             if len(active_nodes) == 1:
                 print(f"{active_nodes[0].node.name=}")
                 self.context = active_nodes[0].context
+                self.current_node = active_nodes[0].node
+
+            # FIXME: intermediate nodes' context update gets lost!
 
             # Check if all nodes have stopped (waiting or done)
             if all(
@@ -391,6 +427,13 @@ class Graph:
                     all_keys.extend(partial_context.keys())
 
                 assert len(set(all_keys)) == len(all_keys), "All keys must be unique"
+                # if len(partial_contexts) > 1:
+                #     print(partial_contexts)
+                #     print(self.context)
+
+                #     import sys
+
+                #     sys.exit()
 
                 merged_context_dict = {}
                 for partial_context in partial_contexts:
@@ -406,9 +449,10 @@ class Graph:
                 is_done = all(node.is_done for node in active_nodes)
                 is_waiting = all(node.is_waiting for node in active_nodes)
                 if is_waiting or is_done:
+                    self.t += 1
                     return merged_context, is_done
                 else:
-                    print(merged_context)
+                    # print(merged_context)
                     active_nodes = [
                         NodeState(active_nodes[0].node, merged_context, merged_context)
                     ]
@@ -431,11 +475,16 @@ class Graph:
                 await callback(context)
 
         subset_context = create_subset_model(context, node.input_fields)
+        start_time = time.time()
+        end_time = -1
+        duration = -1
         try:
             print(
                 f"[blue] [{self.t}] [/blue] [orange] RUNNING NODE [/orange] {node.name}"
             )
-            context_update, logs = await node.run_with_logs(subset_context)
+            context_update, logs = await node.run_with_logs(subset_context, self.run_id)
+            end_time = time.time()
+            duration = end_time - start_time
             print(
                 f"[blue] [{self.t}] [/blue] [green] FINISHED NODE [/green] {node.name}"
             )
@@ -443,17 +492,19 @@ class Graph:
             error_msg: str = str(e)
             traceback_details: str = traceback.format_exc()
             event = Event(
-                    output=None,
-                    context=subset_context,
-                    event_type="node_execution_error",
-                    name=node.name,
-                    run_id=self.id,
-                    message=f"{error_msg}\nTraceback: {traceback_details}",
-                    logs="\n".join(node._logs),
-                    t=self.t,
-                )
+                output=None,
+                context=subset_context,
+                event_type="node_execution_error",
+                name=node.name,
+                run_id=self.run_id,
+                message=f"{error_msg}\nTraceback: {traceback_details}",
+                logs="\n".join(node._logs),
+                start_time=start_time,
+                end_time=end_time,
+                duration=duration,
+                t=self.t,
+            )
             if self.on_event is not None:
-                print('On event!!!!')
                 await self.on_event(event)
             print(f"[red]ERRRRRRRROOOOOOOOOR")
             await asyncio.sleep(1)
@@ -471,8 +522,11 @@ class Graph:
                 context=subset_context,
                 event_type="state_exit",
                 name=node.name,
-                run_id=self.id,
+                run_id=self.run_id,
                 logs="\n".join(logs),
+                start_time=start_time,
+                end_time=end_time,
+                duration=duration,
                 t=self.t,
             )
         )
@@ -482,6 +536,25 @@ class Graph:
                 await callback(new_context)
 
         next_nodes = self.get_next_nodes(node.name, new_context, self.t)
+        next_nodes_names = [n.name for n in next_nodes]
+
+        # if set(next_nodes_names) == {"decide_to_run_tool", "analyze_query"}:
+        #     ipdb.set_trace()
+
+        assert (
+            not "start" in next_nodes_names
+        ), f"Node {node.name} has a next node named 'start'"
+
+        if len(next_nodes) > 1:
+            assert (
+                node.allow_flow_split
+            ), f"Node {node.name} has multiple outgoing edges but is not set to allow flow split"
+        else:
+            assert (
+                not node.allow_flow_split
+            ), f"Node {node.name} has only one outgoing edge but is set to allow flow split"
+
+        print(f"{next_nodes_names=}")
         return [
             NodeState(
                 next_node,
@@ -503,8 +576,13 @@ class Graph:
 
         next_nodes = []
         for edge in matching_edges:
+            start_time = time.time()
+            end_time = -1
+            duration = -1
             try:
                 next_node_names = edge.fn(context)
+                end_time = time.time()
+                duration = end_time - start_time
                 if isinstance(next_node_names, str):
                     next_node_names = [next_node_names]
                 for next_node_name in next_node_names:
@@ -512,6 +590,9 @@ class Graph:
                         next_node_name in edge.out_nodes
                     ), f"Edge {edge.name} does not have a valid out node {next_node_name}"
                     next_nodes.append(self.nodes[next_node_name])
+                print(
+                    f"[red]Node {current_node_name}[/red] -> [yellow]Edge {edge.name} [/yellow] -> {next_node_names}"
+                )
             except Exception as e:
                 self.__log_event(
                     Event(
@@ -519,9 +600,12 @@ class Graph:
                         context=context,
                         event_type="edge_execution_error",
                         name=edge.name,
-                        run_id=self.id,
+                        run_id=self.run_id,
                         message=str(e),
                         t=t,
+                        start_time=start_time,
+                        end_time=end_time,
+                        duration=duration,
                     )
                 )
                 raise e
