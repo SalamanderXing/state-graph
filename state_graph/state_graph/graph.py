@@ -131,9 +131,9 @@ class Graph:
     edges: dict[str, Edge]
     graph: nx.MultiDiGraph
     current_node: Node
-    context: BaseModel
-    static_context: BaseModel
-    __initial_context: BaseModel
+    # context: BaseModel
+    # static_context: BaseModel
+    # __initial_context: BaseModel
     __on_state_enter_callbacks: dict[str, Callable[[BaseModel], Awaitable] | None]
     __on_state_exit_callbacks: dict[str, Callable[[BaseModel], Awaitable] | None]
     __stream_token: Callable[[str], Awaitable]
@@ -141,6 +141,7 @@ class Graph:
     guards: list[Callable[[BaseModel], str | None]] = []
     on_event: Callable[[Event], Awaitable] | None = None
     run_id: str
+    current_node: Node
 
     @property
     def reset_stream(self):
@@ -215,26 +216,26 @@ class Graph:
 
         self.__is_compiled = True
 
-    def reset(
-        self, new_state: dict[str, Any] | None = None, id: str | None = None
-    ) -> "Graph":
-        new_state = new_state or {}
-        dump = self.__initial_context.model_copy().model_dump() | new_state
-        initial_context = self.__initial_context.__class__(**dump)
-        new_graph = Graph(
-            context=initial_context,
-            static_context=self.static_context,
-            name=self.graph.name,
-            nodes=self.nodes.copy(),
-            edges=self.edges.copy(),
-            stream_token=self.__stream_token,
-            _is_compiled=self.__is_compiled,
-            id=id,
-            reset_stream=self.__reset_stream,
-            guards=self.guards,
-            on_event=self.on_event,
-        )
-        return new_graph
+    # def reset(
+    #     self, new_state: dict[str, Any] | None = None, id: str | None = None
+    # ) -> "Graph":
+    #     new_state = new_state or {}
+    #     dump = self.__initial_context.model_copy().model_dump() | new_state
+    #     initial_context = self.__initial_context.__class__(**dump)
+    #     new_graph = Graph(
+    #         context=initial_context,
+    #         static_context=self.static_context,
+    #         name=self.graph.name,
+    #         nodes=self.nodes.copy(),
+    #         edges=self.edges.copy(),
+    #         stream_token=self.__stream_token,
+    #         _is_compiled=self.__is_compiled,
+    #         id=id,
+    #         reset_stream=self.__reset_stream,
+    #         guards=self.guards,
+    #         on_event=self.on_event,
+    #     )
+    #     return new_graph
 
     def __init__(
         self,
@@ -357,14 +358,16 @@ class Graph:
                 print(f"{result=}")
                 assert False, f"Guard {guard}\nfailed: {message}\nError Cause: {result}"
 
-    async def run(self, input: dict[str, Any] | None = None) -> tuple[BaseModel, bool]:
+    async def run(
+        self, context: BaseModel, static_context: BaseModel
+    ) -> tuple[BaseModel, bool]:
         assert self.__is_compiled, "Graph must be compiled before running"
         input = input or {}
 
         if self.current_node.name == "start":
             assert self.t == 0, "Graph must be reset before running"
 
-        self.context = utils.merge_context(self.context, input)
+        # self.context = utils.merge_context(self.context, input)
         active_nodes = await self.run_node(
             NodeState(self.current_node, self.context, self.context)
         )
@@ -427,13 +430,6 @@ class Graph:
                     all_keys.extend(partial_context.keys())
 
                 assert len(set(all_keys)) == len(all_keys), "All keys must be unique"
-                # if len(partial_contexts) > 1:
-                #     print(partial_contexts)
-                #     print(self.context)
-
-                #     import sys
-
-                #     sys.exit()
 
                 merged_context_dict = {}
                 for partial_context in partial_contexts:
@@ -452,7 +448,6 @@ class Graph:
                     self.t += 1
                     return merged_context, is_done
                 else:
-                    # print(merged_context)
                     active_nodes = [
                         NodeState(active_nodes[0].node, merged_context, merged_context)
                     ]
